@@ -1,0 +1,123 @@
+%pip install fastparquet cramjam fsspec appdirs
+%pip install --no-deps nfl_data_py==0.3.3
+
+import nfl_data_py as nfl, pandas as pd, fastparquet, cramjam
+import nfl_data_py as nfl
+
+pbp_2023 = nfl.import_pbp_data([2023])
+len(pbp_2023), pbp_2023["play_type"].value_counts().head(10)
+pbp_2023.info()
+pbp_2023.describe().T.head(12)
+pbp_2023.isna().mean().sort_values(ascending=False).head(15)
+
+scoring = pbp_2023.assign(
+    score_event = (
+        pbp_2023["touchdown"].fillna(0).astype(int)
+        + (pbp_2023["field_goal_result"].eq("made")).astype(int)
+        + (pbp_2023["extra_point_result"].eq("good")).astype(int)
+        + (pbp_2023["two_point_conv_result"].eq("success")).astype(int)
+        + (pbp_2023["safety"].fillna(0).astype(int))
+    )
+)
+scoring["score_event"].value_counts()
+
+list(pbp_2023.columns)
+
+pbp_2023
+
+def _col(c): 
+    return pbp_2023[c].fillna(0)
+
+# Passing fantasy scoring
+passer_fp = (
+    _col("passing_yards") * 0.04          # 1 point per 25 passing yards
+    + _col("pass_touchdown") * 4          # 4 points per passing TD
+    - _col("interception") * 2            # -2 points per interception
+)
+
+# 2-pt conversions
+passer_2pt = (
+    ((_col("two_point_attempt") == 1) & (_col("pass") == 1) & (pbp_2023["two_point_conv_result"] == "success"))
+    .astype(int) * 2
+)
+passer_fp += passer_2pt
+
+
+df_pass = pd.DataFrame({
+    "player_name": pbp_2023["passer_player_name"],
+    "fp": passer_fp
+}).dropna(subset=["player_name"])
+
+df_pass.head(10)
+
+# Rushing fantasy scoring
+rusher_fp = (
+    _col("rushing_yards") * 0.1          # 1 point per 10 rushing yards
+    + _col("rush_touchdown") * 6         # 6 points per rushing TD
+)
+
+# 2-pt conversions (successful rush attempt)
+rusher_2pt = (
+    ((_col("two_point_attempt") == 1) & (_col("rush") == 1) & (pbp_2023["two_point_conv_result"] == "success"))
+    .astype(int) * 2
+)
+rusher_fp += rusher_2pt
+
+df_rush = pd.DataFrame({
+    "player_name": pbp_2023["rusher_player_name"],
+    "fp": rusher_fp
+}).dropna(subset=["player_name"])
+
+df_rush.head(10)
+
+# Receiving
+rec_flag = (
+    (pbp_2023.get("complete_pass", 0).fillna(0).astype(int) == 1)
+    & (pbp_2023["receiver_player_name"].notna())
+).astype(int)
+
+receiver_fp = (
+    pbp_2023.get("receiving_yards", 0).fillna(0) * 0.1   # 1 per 10 receiving yards
+    + rec_flag * 1                                       # +1 per reception (PPR)
+    + pbp_2023.get("pass_touchdown", 0).fillna(0) * 6    # receiving TDs
+)
+
+#2-pt receptions
+recv_2pt = (
+    (pbp_2023.get("two_point_attempt", 0).fillna(0).astype(int) == 1)
+    & (pbp_2023.get("pass", 0).fillna(0).astype(int) == 1)
+    & (pbp_2023["two_point_conv_result"] == "success")
+).astype(int) * 2
+receiver_fp = receiver_fp + recv_2pt
+
+df_recv = pd.DataFrame({
+    "player_name": pbp_2023["receiver_player_name"],
+    "fp": receiver_fp
+}).dropna(subset=["player_name"])
+
+df_recv.head(10)
+
+#fumbles
+df_fumbles = pd.DataFrame({
+    "player_name": pbp_2023["fumbled_1_player_name"],
+    "fp": pbp_2023.get("fumble_lost", 0).fillna(0) * -2
+}).dropna(subset=["player_name"])
+
+df_fumbles.head(10)
+
+#total fantasy points
+fp_long = pd.concat([df_pass, df_rush, df_recv, df_fumbles], ignore_index=True)
+
+player_fp_ppr = (fp_long
+                 .groupby("player_name", dropna=True)["fp"]
+                 .sum()
+                 .sort_values(ascending=False))
+
+player_fp_ppr.head(20)
+
+#total fantasy points by position
+top_qbs = (df_pass.groupby("player_name")["fp"].sum().sort_values(ascending=False).head(10))
+top_rbs = (df_rush.groupby("player_name")["fp"].sum().sort_values(ascending=False).head(10))
+top_wrs = (df_recv.groupby("player_name")["fp"].sum().sort_values(ascending=False).head(10))
+
+top_qbs, top_rbs, top_wrs
