@@ -1,0 +1,304 @@
+import numpy as np
+import pandas as pd
+import nfl_data_py as nfl
+
+# ----------------------------------
+# Config
+# ----------------------------------
+ALL_SEASONS = list(range(1999, 2024))  # 1999–2023 in one pass
+
+def fantasy_week_max(season: int) -> int:
+    # Common fantasy policy: stop before NFL's final week
+    # <=2020: Week 16; >=2021: Week 17
+    return 16 if season <= 2020 else 17
+
+# ----------------------------------
+# Team normalization (historical)
+# ----------------------------------
+# Normalize to SEASON-ACCURATE abbreviations:
+# - Rams:   STL through 2015, LAR 2016+
+# - Raiders: OAK through 2019, LV 2020+
+# - Chargers: SD through 2016, LAC 2017+
+# Everything else: pass-through
+def normalize_team(team: str, season: int) -> str:
+    t = (team or "").upper()
+    # Rams
+    if season <= 2015 and t in {"LAR", "LA", "STL"}:
+        return "STL"
+    if season >= 2016 and t in {"LAR", "LA", "STL"}:
+        return "LAR"
+    # Raiders
+    if season <= 2019 and t in {"OAK", "LV"}:
+        return "OAK"
+    if season >= 2020 and t in {"OAK", "LV"}:
+        return "LV"
+    # Chargers
+    if season <= 2016 and t in {"SD", "LAC"}:
+        return "SD"
+    if season >= 2017 and t in {"SD", "LAC"}:
+        return "LAC"
+    return t
+
+# ----------------------------------
+# Utilities
+# ----------------------------------
+def base_filter(df: pd.DataFrame, week_min: int, week_max: int) -> pd.DataFrame:
+    out = df.query("season_type == 'REG' and @week_min <= week <= @week_max").copy()
+    if "play_deleted" in out.columns:
+        out = out[out["play_deleted"].fillna(0) != 1]
+    if "play_type" in out.columns:
+        out = out[out["play_type"] != "no_play"]
+    return out
+
+def safe_col(df, name, default=0):
+    return df[name].fillna(0) if name in df.columns else 0
+
+# ----------------------------------
+# 1) Player PPR (ESPN-standard)
+# ----------------------------------
+def player_ppr(pbp_reg: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    df = pbp_reg.copy()
+
+    pass_attempt = (df.get("pass_attempt", df.get("pass", 0)).fillna(0).astype(int) == 1)
+    rush_attempt = (df.get("rush_attempt", df.get("rush", 0)).fillna(0).astype(int) == 1)
+    complete_pass = (df.get("complete_pass", 0).fillna(0).astype(int) == 1)
+
+    pass_role = pass_attempt & (df["fantasy_player_id"] == df["passer_player_id"])
+    rush_role = rush_attempt & (df["fantasy_player_id"] == df["rusher_player_id"])
+    recv_role = complete_pass & (df["fantasy_player_id"] == df["receiver_player_id"])
+
+    # Passing
+    pass_fp = np.where(pass_role,
+                       safe_col(df,"passing_yards")*0.04 + safe_col(df,"pass_touchdown")*4 - safe_col(df,"interception")*2,
+                       0)
+    # Rushing
+    rush_fp = np.where(rush_role,
+                       safe_col(df,"rushing_yards")*0.1 + safe_col(df,"rush_touchdown")*6,
+                       0)
+    # Receiving (PPR + yards + receiving TDs)
+    reception_pts = np.where(recv_role, 1, 0)
+    recv_yards_td = np.where(recv_role,
+                             safe_col(df,"receiving_yards")*0.1 + safe_col(df,"pass_touchdown")*6,
+                             0)
+
+    # 2-pt conversions (success only): credit receiver on pass or rusher on rush
+    two_pt_success = (safe_col(df,"two_point_attempt") == 1) & (df.get("two_point_conv_result","") == "success")
+    two_pt_recv = two_pt_success & (safe_col(df,"pass") == 1) & (df["fantasy_player_id"] == df["receiver_player_id"])
+    two_pt_rush = two_pt_success & (safe_col(df,"rush") == 1) & (df["fantasy_player_id"] == df["rusher_player_id"])
+    two_pt_fp = np.where(two_pt_recv | two_pt_rush, 2, 0)
+
+    # Fumbles lost
+    fum_fp = np.where((safe_col(df,"fumble_lost") == 1) & (df["fantasy_player_id"] == df.get("fumbled_1_player_id")),
+                      -2, 0)
+
+    df["fp"] = pass_fp + rush_fp + reception_pts + recv_yards_td + two_pt_fp + fum_fp
+
+    leaders = (df.groupby(["season","fantasy_player_id","fantasy_player_name"], as_index=False)["fp"].sum()
+                 .sort_values(["season","fp"], ascending=[True, False]))
+    games = (df.loc[df["fp"] != 0]
+               .groupby(["season","fantasy_player_id","fantasy_player_name"], as_index=False)["week"].nunique()
+               .rename(columns={"week":"games"}))
+    leaders = leaders.merge(games, on=["season","fantasy_player_id","fantasy_player_name"], how="left")
+    leaders["ppg"] = leaders["fp"] / leaders["games"]
+
+    weekly = (df.groupby(["season","fantasy_player_id","fantasy_player_name","week"], as_index=False)["fp"].sum()
+                .sort_values(["season","fantasy_player_name","week"]))
+
+    return leaders, weekly
+
+# ----------------------------------
+# 2) Defense/Special Teams (D/ST)
+# ----------------------------------
+def dst_scoring(pbp_reg: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    df = pbp_reg.copy()
+
+    # Final scores + teams per game
+    scores = (df.groupby(["season","game_id"], as_index=False)[["total_home_score","total_away_score","home_team","away_team"]]
+                .agg({"total_home_score":"max","total_away_score":"max","home_team":"first","away_team":"first"})
+                .rename(columns={"total_home_score":"home_pts_final","total_away_score":"away_pts_final"}))
+
+    home_rows = scores[["season","game_id","home_team","away_pts_final"]].rename(
+        columns={"home_team":"team","away_pts_final":"points_allowed"})
+    away_rows = scores[["season","game_id","away_team","home_pts_final"]].rename(
+        columns={"away_team":"team","home_pts_final":"points_allowed"})
+    pa_tbl = pd.concat([home_rows, away_rows], ignore_index=True)
+
+    # Points-allowed tiers (ESPN-ish)
+    def pa_to_pts(pa: int) -> int:
+        if pa == 0: return 10
+        if pa <= 6: return 7
+        if pa <= 13: return 4
+        if pa <= 17: return 1
+        if pa <= 27: return 0
+        if pa <= 34: return -1
+        if pa <= 45: return -4
+        return -5
+
+    pa_tbl["pa_pts"] = pa_tbl["points_allowed"].astype(int).map(pa_to_pts)
+
+    # Tallies by defense
+    by_def = (df.groupby(["season","game_id","defteam"], as_index=False)
+                .agg({"sack":"sum","interception":"sum","safety":"sum","punt_blocked":"sum"})
+                .rename(columns={"defteam":"team"}))
+
+    # Blocked FGs
+    tmp = df.copy()
+    tmp["fg_block"] = (tmp.get("field_goal_result","").astype(str).str.lower() == "blocked").astype(int)
+    by_def_fgblk = (tmp.groupby(["season","game_id","defteam"], as_index=False)["fg_block"].sum()
+                      .rename(columns={"defteam":"team"}))
+
+    # Fumble recoveries credited to recovering team
+    fr_parts = []
+    if "fumble_recovery_1_team" in df.columns:
+        fr1 = df[df["fumble_recovery_1_team"].notna()][["season","game_id","fumble_recovery_1_team"]].copy()
+        fr1["team"] = fr1["fumble_recovery_1_team"]; fr1["fr"] = 1
+        fr_parts.append(fr1[["season","game_id","team","fr"]])
+    if "fumble_recovery_2_team" in df.columns:
+        fr2 = df[df["fumble_recovery_2_team"].notna()][["season","game_id","fumble_recovery_2_team"]].copy()
+        fr2["team"] = fr2["fumble_recovery_2_team"]; fr2["fr"] = 1
+        fr_parts.append(fr2[["season","game_id","team","fr"]])
+    by_fr = (pd.concat(fr_parts, ignore_index=True)
+             .groupby(["season","game_id","team"], as_index=False)["fr"].sum()) if fr_parts else \
+            pd.DataFrame(columns=["season","game_id","team","fr"])
+
+    # Return TDs (credited to return team)
+    ret = df[(safe_col(df,"return_touchdown") == 1)]
+    by_ret_td = (ret.groupby(["season","game_id","return_team"], as_index=False).size()
+                   .rename(columns={"return_team":"team","size":"ret_td"}))
+
+    # Merge all components
+    dst = pa_tbl[["season","game_id","team","pa_pts"]].copy()
+    for part in [
+        by_def[["season","game_id","team","sack","interception","safety","punt_blocked"]],
+        by_def_fgblk[["season","game_id","team","fg_block"]],
+        by_fr[["season","game_id","team","fr"]],
+        by_ret_td[["season","game_id","team","ret_td"]],
+    ]:
+        dst = dst.merge(part, on=["season","game_id","team"], how="left")
+
+    dst = dst.fillna(0)
+    for c in ["sack","interception","safety","punt_blocked","fg_block","fr","ret_td"]:
+        if c in dst.columns: dst[c] = dst[c].astype(int)
+
+    # Normalize historical team code
+    dst["team"] = [normalize_team(t, s) for t, s in zip(dst["team"].astype(str), dst["season"].astype(int))]
+
+    dst["dst_fp"] = (
+        dst["sack"]*1 + dst["interception"]*2 + dst["fr"]*2 + dst["safety"]*2
+        + dst["ret_td"]*6 + (dst["punt_blocked"] + dst["fg_block"])*2 + dst["pa_pts"]
+    )
+
+    per_game = dst.sort_values(["season","game_id","team"]).reset_index(drop=True)
+    season = (per_game.groupby(["season","team"], as_index=False)["dst_fp"].sum()
+                      .sort_values(["season","dst_fp"], ascending=[True, False]))
+    return season, per_game
+
+# ----------------------------------
+# 3) Kickers (ESPN-style)
+# ----------------------------------
+def kicker_scoring(pbp_reg: pd.DataFrame, miss_pat_minus_one=False) -> tuple[pd.DataFrame, pd.DataFrame]:
+    df = pbp_reg.copy()
+    kick = df[(safe_col(df,"field_goal_attempt") == 1) | (safe_col(df,"extra_point_attempt") == 1)].copy()
+
+    for c in ["field_goal_result","extra_point_result"]:
+        if c in kick.columns: kick[c] = kick[c].astype(str).str.lower()
+
+    # FG made by distance
+    fg_made = (safe_col(kick,"field_goal_attempt") == 1) & (kick["field_goal_result"] == "made")
+    dist = safe_col(kick,"kick_distance").astype(float)
+    fg_pts = np.where(fg_made & (dist >= 60), 6,
+              np.where(fg_made & (dist >= 50), 5,
+              np.where(fg_made & (dist >= 40), 4,
+              np.where(fg_made, 3, 0))))
+
+    # Missed FG (includes blocked)
+    fg_miss = (safe_col(kick,"field_goal_attempt") == 1) & (kick["field_goal_result"].isin(["missed","blocked"]))
+    fg_miss_pts = np.where(fg_miss, -1, 0)
+
+    # PATs
+    pat_attempt = (safe_col(kick,"extra_point_attempt") == 1)
+    pat_good = pat_attempt & (kick["extra_point_result"].isin(["good","made"]))
+    pat_pts = np.where(pat_good, 1, 0)
+    pat_missed = pat_attempt & (kick["extra_point_result"].isin(["failed","missed","blocked"]))
+    pat_miss_pts = np.where(miss_pat_minus_one & pat_missed, -1, 0)
+
+    kick["k_fp"] = fg_pts + fg_miss_pts + pat_pts + pat_miss_pts
+
+    id_col = "kicker_player_id" if "kicker_player_id" in kick.columns else "fantasy_player_id"
+    name_col = "kicker_player_name" if "kicker_player_name" in kick.columns else "fantasy_player_name"
+
+    per_game = (kick.groupby(["season","game_id", id_col, name_col, "posteam"], as_index=False)
+                  .agg(k_fp=("k_fp","sum"),
+                       fg_made=("field_goal_attempt", lambda s: int(((s==1) & (kick.loc[s.index,'field_goal_result'].eq('made'))).sum())),
+                       fg_att=("field_goal_attempt","sum"),
+                       pat_made=("extra_point_attempt", lambda s: int(((s==1) & (kick.loc[s.index,'extra_point_result'].isin(['good','made']))).sum())),
+                       pat_att=("extra_point_attempt","sum"))
+               )
+
+    # Normalize team code historically for posteam in outputs
+    per_game["posteam"] = [normalize_team(t, s) for t, s in zip(per_game["posteam"].astype(str), per_game["season"].astype(int))]
+
+    season = (per_game.groupby(["season", id_col, name_col, "posteam"], as_index=False)
+                      .agg(total_fp=("k_fp","sum"),
+                           games=("game_id","nunique"),
+                           fg_made=("fg_made","sum"),
+                           fg_att=("fg_att","sum"),
+                           pat_made=("pat_made","sum"),
+                           pat_att=("pat_att","sum")))
+    season["ppg"] = season["total_fp"] / season["games"]
+    season = season.sort_values(["season","total_fp","ppg"], ascending=[True, False, False])
+    return season, per_game
+
+# ----------------------------------
+# Runner (streams seasons safely)
+# ----------------------------------
+players_all, players_weekly_all = [], []
+dst_all, dst_games_all = [], []
+k_all, k_games_all = [], []
+
+for yr in ALL_SEASONS:
+    print(f"Processing {yr} ...")
+    pbp_y = nfl.import_pbp_data([yr])
+    wk_max = fantasy_week_max(yr)
+    pbp_reg = base_filter(pbp_y, week_min=1, week_max=wk_max)
+
+    # Optional RAM saver
+    for c in pbp_reg.select_dtypes("float64").columns:
+        pbp_reg[c] = pbp_reg[c].astype("float32")
+    print(f"{yr} done.\nDowncasting floats.")
+
+    # Players
+    p_season, p_weekly = player_ppr(pbp_reg)
+    players_all.append(p_season)
+    players_weekly_all.append(p_weekly)
+
+    # D/ST
+    d_season, d_games = dst_scoring(pbp_reg)
+    dst_all.append(d_season)
+    dst_games_all.append(d_games)
+
+    # Kickers
+    k_season, k_games = kicker_scoring(pbp_reg, miss_pat_minus_one=False)
+    k_all.append(k_season)
+    k_games_all.append(k_games)
+
+# Concatenate multi-season outputs
+players_leaders_multi = pd.concat(players_all, ignore_index=True)
+players_weekly_multi  = pd.concat(players_weekly_all, ignore_index=True)
+dst_season_multi      = pd.concat(dst_all, ignore_index=True)
+dst_per_game_multi    = pd.concat(dst_games_all, ignore_index=True)
+k_season_multi        = pd.concat(k_all, ignore_index=True)
+k_per_game_multi      = pd.concat(k_games_all, ignore_index=True)
+
+# Examples:
+display(players_leaders_multi.groupby("season").head(10))
+display(dst_season_multi.groupby("season").head(10))
+display(k_season_multi.groupby("season").head(10))
+
+# (Optional) Save to files for dashboards
+# players_leaders_multi.to_parquet("players_ppr_allseasons.parquet", index=False)
+# players_weekly_multi.to_parquet("players_weekly_ppr_allseasons.parquet", index=False)
+# dst_season_multi.to_parquet("dst_season_allseasons.parquet", index=False)
+# dst_per_game_multi.to_parquet("dst_per_game_allseasons.parquet", index=False)
+# k_season_multi.to_parquet("kickers_season_allseasons.parquet", index=False)
+# k_per_game_multi.to_parquet("kickers_per_game_allseasons.parquet", index=False)
