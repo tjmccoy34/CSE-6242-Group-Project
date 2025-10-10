@@ -1,11 +1,17 @@
+# === Fantasy PPR Scoring with nflreadpy loader (Pandas pipeline) ===
+# - Loads each season via nflreadpy (Polars) → converts to pandas
+# - Applies existing filters & ESPN-standard PPR scoring
+# - Includes historical team normalization and week caps by era
+# - Produces multi-season leaders/weekly (players), D/ST, and kicker tables
+
 import numpy as np
 import pandas as pd
-import nfl_data_py as nfl
+import nflreadpy as nfl
 
 # ----------------------------------
 # Config
 # ----------------------------------
-ALL_SEASONS = list(range(1999, 2024))  # 1999–2023 in one pass
+ALL_SEASONS = list(range(1999, 2025))  # 1999–2023 in one pass
 
 def fantasy_week_max(season: int) -> int:
     # Common fantasy policy: stop before NFL's final week
@@ -59,36 +65,36 @@ def safe_col(df, name, default=0):
 def player_ppr(pbp_reg: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = pbp_reg.copy()
 
-    pass_attempt = (df.get("pass_attempt", df.get("pass", 0)).fillna(0).astype(int) == 1)
-    rush_attempt = (df.get("rush_attempt", df.get("rush", 0)).fillna(0).astype(int) == 1)
-    complete_pass = (df.get("complete_pass", 0).fillna(0).astype(int) == 1)
+    pass_attempt   = (df.get("pass_attempt", df.get("pass", 0)).fillna(0).astype(int) == 1)
+    rush_attempt   = (df.get("rush_attempt", df.get("rush", 0)).fillna(0).astype(int) == 1)
+    complete_pass  = (df.get("complete_pass", 0).fillna(0).astype(int) == 1)
 
-    pass_role = pass_attempt & (df["fantasy_player_id"] == df["passer_player_id"])
-    rush_role = rush_attempt & (df["fantasy_player_id"] == df["rusher_player_id"])
+    pass_role = pass_attempt  & (df["fantasy_player_id"] == df["passer_player_id"])
+    rush_role = rush_attempt  & (df["fantasy_player_id"] == df["rusher_player_id"])
     recv_role = complete_pass & (df["fantasy_player_id"] == df["receiver_player_id"])
 
     # Passing
     pass_fp = np.where(pass_role,
-                       safe_col(df,"passing_yards")*0.04 + safe_col(df,"pass_touchdown")*4 - safe_col(df,"interception")*2,
+                       safe_col(df, "passing_yards")*0.04 + safe_col(df, "pass_touchdown")*4 - safe_col(df, "interception")*2,
                        0)
     # Rushing
     rush_fp = np.where(rush_role,
-                       safe_col(df,"rushing_yards")*0.1 + safe_col(df,"rush_touchdown")*6,
+                       safe_col(df, "rushing_yards")*0.1 + safe_col(df, "rush_touchdown")*6,
                        0)
-    # Receiving (PPR + yards + receiving TDs)
+    # Receiving (PPR + yards + receiving TDs are flagged by pass_touchdown)
     reception_pts = np.where(recv_role, 1, 0)
     recv_yards_td = np.where(recv_role,
-                             safe_col(df,"receiving_yards")*0.1 + safe_col(df,"pass_touchdown")*6,
+                             safe_col(df, "receiving_yards")*0.1 + safe_col(df, "pass_touchdown")*6,
                              0)
 
-    # 2-pt conversions (success only): credit receiver on pass or rusher on rush
-    two_pt_success = (safe_col(df,"two_point_attempt") == 1) & (df.get("two_point_conv_result","") == "success")
-    two_pt_recv = two_pt_success & (safe_col(df,"pass") == 1) & (df["fantasy_player_id"] == df["receiver_player_id"])
-    two_pt_rush = two_pt_success & (safe_col(df,"rush") == 1) & (df["fantasy_player_id"] == df["rusher_player_id"])
+    # 2-pt conversions: credit receiver on pass or rusher on rush (success only)
+    two_pt_success = (safe_col(df, "two_point_attempt") == 1) & (df.get("two_point_conv_result", "") == "success")
+    two_pt_recv = two_pt_success & (safe_col(df, "pass") == 1) & (df["fantasy_player_id"] == df["receiver_player_id"])
+    two_pt_rush = two_pt_success & (safe_col(df, "rush") == 1) & (df["fantasy_player_id"] == df["rusher_player_id"])
     two_pt_fp = np.where(two_pt_recv | two_pt_rush, 2, 0)
 
     # Fumbles lost
-    fum_fp = np.where((safe_col(df,"fumble_lost") == 1) & (df["fantasy_player_id"] == df.get("fumbled_1_player_id")),
+    fum_fp = np.where((safe_col(df, "fumble_lost") == 1) & (df["fantasy_player_id"] == df.get("fumbled_1_player_id")),
                       -2, 0)
 
     df["fp"] = pass_fp + rush_fp + reception_pts + recv_yards_td + two_pt_fp + fum_fp
@@ -198,25 +204,26 @@ def dst_scoring(pbp_reg: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 # ----------------------------------
 def kicker_scoring(pbp_reg: pd.DataFrame, miss_pat_minus_one=False) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = pbp_reg.copy()
-    kick = df[(safe_col(df,"field_goal_attempt") == 1) | (safe_col(df,"extra_point_attempt") == 1)].copy()
+    kick = df[(safe_col(df, "field_goal_attempt") == 1) | (safe_col(df, "extra_point_attempt") == 1)].copy()
 
     for c in ["field_goal_result","extra_point_result"]:
-        if c in kick.columns: kick[c] = kick[c].astype(str).str.lower()
+        if c in kick.columns: 
+            kick[c] = kick[c].astype(str).str.lower()
 
     # FG made by distance
-    fg_made = (safe_col(kick,"field_goal_attempt") == 1) & (kick["field_goal_result"] == "made")
-    dist = safe_col(kick,"kick_distance").astype(float)
+    fg_made = (safe_col(kick, "field_goal_attempt") == 1) & (kick["field_goal_result"] == "made")
+    dist = safe_col(kick, "kick_distance").astype(float)
     fg_pts = np.where(fg_made & (dist >= 60), 6,
               np.where(fg_made & (dist >= 50), 5,
               np.where(fg_made & (dist >= 40), 4,
               np.where(fg_made, 3, 0))))
 
     # Missed FG (includes blocked)
-    fg_miss = (safe_col(kick,"field_goal_attempt") == 1) & (kick["field_goal_result"].isin(["missed","blocked"]))
+    fg_miss = (safe_col(kick, "field_goal_attempt") == 1) & (kick["field_goal_result"].isin(["missed","blocked"]))
     fg_miss_pts = np.where(fg_miss, -1, 0)
 
     # PATs
-    pat_attempt = (safe_col(kick,"extra_point_attempt") == 1)
+    pat_attempt = (safe_col(kick, "extra_point_attempt") == 1)
     pat_good = pat_attempt & (kick["extra_point_result"].isin(["good","made"]))
     pat_pts = np.where(pat_good, 1, 0)
     pat_missed = pat_attempt & (kick["extra_point_result"].isin(["failed","missed","blocked"]))
@@ -250,7 +257,7 @@ def kicker_scoring(pbp_reg: pd.DataFrame, miss_pat_minus_one=False) -> tuple[pd.
     return season, per_game
 
 # ----------------------------------
-# Runner (streams seasons safely)
+# Runner (streams seasons safely) — uses nflreadpy loader
 # ----------------------------------
 players_all, players_weekly_all = [], []
 dst_all, dst_games_all = [], []
@@ -258,7 +265,10 @@ k_all, k_games_all = [], []
 
 for yr in ALL_SEASONS:
     print(f"Processing {yr} ...")
-    pbp_y = nfl.import_pbp_data([yr])
+    # Load via nflreadpy (Polars) then convert to pandas
+    pbp_pl = nfl.load_pbp([yr])      # Polars DataFrame
+    pbp_y  = pbp_pl.to_pandas()      # hand off to pandas pipeline
+
     wk_max = fantasy_week_max(yr)
     pbp_reg = base_filter(pbp_y, week_min=1, week_max=wk_max)
 
