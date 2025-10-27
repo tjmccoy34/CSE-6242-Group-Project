@@ -1,0 +1,277 @@
+# ================================
+# TE dataframe construction (final, PPR-aligned games + position filter)
+# Reuses from our PPR script:
+#   - ALL_SEASONS
+#   - fantasy_week_max(season)
+#   - base_filter(df, week_min, week_max)
+#   - safe_col(df, name, default=0)
+#   - normalize_team(team, season)
+#   - players_leaders_multi with unique ['season','fantasy_player_id'] and cols ['fp','games','fantasy_player_name']
+#   - import nflreadpy as nfl
+# ================================
+
+from datetime import datetime
+import numpy as np
+import pandas as pd
+
+def _ensure_te_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure columns exist/cast for stable TE aggregations across vintages."""
+    # Flags / ints
+    must_int = ["pass_attempt", "rush_attempt", "complete_pass", "pass_touchdown", "rush_touchdown", "fumble_lost"]
+    # Totals / floats
+    must_float = ["receiving_yards", "rushing_yards", "air_yards", "yards_after_catch", "epa"]
+
+    # Backfill attempt flags if legacy names present
+    if "pass_attempt" not in df.columns and "pass" in df.columns:
+        df["pass_attempt"] = df["pass"]
+    if "rush_attempt" not in df.columns and "rush" in df.columns:
+        df["rush_attempt"] = df["rush"]
+
+    for c in must_int:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = df[c].fillna(0).astype("int64")
+
+    for c in must_float:
+        if c not in df.columns:
+            df[c] = 0.0
+        df[c] = df[c].astype("float64").fillna(0.0)
+
+    return df
+
+
+def engineer_te_features_for_season(season: int) -> pd.DataFrame:
+    # Load & cap to fantasy-eligible REG weeks
+    pbp_pl = nfl.load_pbp([season])
+    pbp = pbp_pl.to_pandas()
+    wk_max = fantasy_week_max(season)
+    pbp = base_filter(pbp, week_min=1, week_max=wk_max)
+
+    # Safety across vintages
+    pbp = _ensure_te_cols(pbp)
+
+    # ---------- Receiving (targets & receptions credited to receiver role) ----------
+    is_pass = (pbp["pass_attempt"] == 1)
+    has_recv = pbp["receiver_player_id"].notna()
+
+    tgt_rows = pbp[is_pass & has_recv].copy()
+    rec_rows = pbp[(pbp["complete_pass"] == 1) & has_recv].copy()
+
+    # Fumbles lost credited to receiver
+    rec_rows["fl_rec"] = (
+        (rec_rows["fumble_lost"] == 1) &
+        (rec_rows["receiver_player_id"] == rec_rows.get("fumbled_1_player_id"))
+    ).astype(int)
+
+    tgt_g = (
+        tgt_rows.groupby(["season","receiver_player_id","receiver_player_name"], as_index=False)
+        .agg(targets=("play_id","count"))
+        .rename(columns={"receiver_player_id":"player_id","receiver_player_name":"player_name"})
+    )
+
+    rec_g = (
+        rec_rows.groupby(["season","receiver_player_id","receiver_player_name"], as_index=False)
+        .agg(
+            receptions=("complete_pass","sum"),
+            rec_yards=("receiving_yards","sum"),
+            rec_td=("pass_touchdown","sum"),
+            air_yards=("air_yards","sum"),
+            yac=("yards_after_catch","sum"),
+            rec_epa_sum=("epa","sum"),
+            fumbles_lost_rec=("fl_rec","sum")
+        )
+        .rename(columns={"receiver_player_id":"player_id","receiver_player_name":"player_name"})
+    )
+
+    # ---------- TE rushing ----------
+    rush_rows = pbp[(pbp["rush_attempt"] == 1) & pbp["rusher_player_id"].notna()].copy()
+    # Fumbles lost credited to the rusher
+    rush_rows["fl_rush"] = (
+        (rush_rows["fumble_lost"] == 1) &
+        (rush_rows["rusher_player_id"] == rush_rows.get("fumbled_1_player_id"))
+    ).astype(int)
+
+    rush_g = (
+        rush_rows.groupby(["season","rusher_player_id","rusher_player_name"], as_index=False)
+        .agg(
+            te_rush_att=("rush_attempt","sum"),
+            te_rush_yards=("rushing_yards","sum"),
+            te_rush_td=("rush_touchdown","sum"),
+            fumbles_lost_rush=("fl_rush","sum"),
+        )
+        .rename(columns={"rusher_player_id":"player_id","rusher_player_name":"player_name"})
+    )
+
+    # ---------- Combine receiving + rushing ----------
+    te = (
+        tgt_g.merge(rec_g, on=["season","player_id","player_name"], how="outer")
+             .merge(rush_g, on=["season","player_id","player_name"], how="left")
+             .fillna({
+                 "targets":0, "receptions":0, "rec_yards":0.0, "rec_td":0,
+                 "air_yards":0.0, "yac":0.0, "rec_epa_sum":0.0, "fumbles_lost_rec":0,
+                 "te_rush_att":0, "te_rush_yards":0.0, "te_rush_td":0, "fumbles_lost_rush":0,
+             })
+    )
+
+    # ---------- Modal team per player-season ----------
+    team_source = pd.concat([
+        tgt_rows[["season","receiver_player_id","posteam"]].rename(columns={"receiver_player_id":"pid","posteam":"team"}),
+        rush_rows[["season","rusher_player_id","posteam"]].rename(columns={"rusher_player_id":"pid","posteam":"team"}),
+    ], ignore_index=True)
+
+    team_mode = (
+        team_source.dropna(subset=["pid","team"])
+                   .groupby(["season","pid"])["team"]
+                   .agg(lambda s: s.dropna().astype(str).mode().iloc[0] if len(s.dropna()) > 0 else np.nan)
+                   .reset_index()
+                   .rename(columns={"pid":"player_id","team":"team"})
+    )
+
+    te = te.merge(team_mode, on=["season","player_id"], how="left")
+    if "team" in te.columns:
+        te["team"] = [normalize_team(str(t), int(s)) if pd.notna(t) else np.nan
+                      for t, s in zip(te["team"], te["season"])]
+
+    # ---------- Team targets & target share ----------
+    team_tgts = (
+        tgt_rows.groupby(["season","posteam"], as_index=False)
+                .agg(team_targets=("play_id","count"))
+                .rename(columns={"posteam":"team_raw"})
+    )
+    te = te.merge(team_tgts, left_on=["season","team"], right_on=["season","team_raw"], how="left")
+    te = te.drop(columns=["team_raw"], errors="ignore")
+    te["team_targets"] = te["team_targets"].fillna(0).astype(float)
+
+    # ---------- Feature engineering ----------
+    te["adot"] = np.where(te["targets"] > 0, te["air_yards"] / te["targets"], 0.0)
+    te["ypr"] = np.where(te["receptions"] > 0, te["rec_yards"] / te["receptions"], 0.0)
+    te["ypt"] = np.where(te["targets"] > 0, te["rec_yards"] / te["targets"], 0.0)
+    te["yac_per_rec"] = np.where(te["receptions"] > 0, te["yac"] / te["receptions"], 0.0)
+    te["target_share"] = np.where(te["team_targets"] > 0, te["targets"] / te["team_targets"], 0.0)
+
+    # Provisional games = #weeks with target or TE rush (replaced after merge)
+    inv_rows = pd.concat([
+        tgt_rows[["season","week","receiver_player_id"]].rename(columns={"receiver_player_id":"pid"}),
+        rush_rows[["season","week","rusher_player_id"]].rename(columns={"rusher_player_id":"pid"})
+    ], ignore_index=True).dropna(subset=["pid"])
+    inv_weeks = (
+        inv_rows.groupby(["season","pid"], as_index=False)["week"]
+                .nunique()
+                .rename(columns={"pid":"player_id","week":"games"})
+    )
+    te = te.merge(inv_weeks, on=["season","player_id"], how="left")
+    te["games"] = te["games"].fillna(0).astype(float)
+
+    # ---------- Final tidy ----------
+    te = te.rename(columns={"player_id":"fantasy_player_id","player_name":"fantasy_player_name"})
+
+    cols_order = [
+        "season","fantasy_player_id","fantasy_player_name","team",
+        # Receiving
+        "targets","receptions","rec_yards","rec_td","air_yards","yac",
+        "adot","ypr","ypt","yac_per_rec",
+        # Team context
+        "team_targets","target_share",
+        # Rushing (rare)
+        "te_rush_att","te_rush_yards","te_rush_td",
+        # EPA (when meaningful)
+        "rec_epa_sum",
+        # Games (provisional)
+        "games"
+    ]
+    te = te[[c for c in cols_order if c in te.columns]]
+    return te
+
+
+# ---- Positions helper (safe seasons casting) ----
+def load_positions_for(seasons) -> pd.DataFrame:
+    """Load (season, fantasy_player_id, position) from nflreadpy rosters; cast seasons to ints safely."""
+    seasons = pd.Series(seasons).dropna().astype(int)
+    upper = max(datetime.now().year, 2025)
+    seasons = seasons[(seasons >= 1920) & (seasons <= upper)].unique().tolist()
+    if not seasons:
+        raise ValueError("No valid seasons to load positions for.")
+
+    rosters_pl = nfl.load_rosters(seasons)
+    rosters = rosters_pl.to_pandas()
+
+    # Column shims
+    id_col = "gsis_id" if "gsis_id" in rosters.columns else ("player_id" if "player_id" in rosters.columns else None)
+    if id_col is None:
+        raise KeyError("No GSIS id column found in rosters (expected 'gsis_id' or 'player_id').")
+
+    pos_col = "position" if "position" in rosters.columns else ("position_group" if "position_group" in rosters.columns else None)
+    if pos_col is None:
+        raise KeyError("No position column found in rosters (expected 'position' or 'position_group').")
+
+    keep = rosters[["season", id_col, pos_col]].copy()
+    keep = keep.rename(columns={id_col: "fantasy_player_id", pos_col: "position"})
+    keep = (keep.sort_values(["season","fantasy_player_id"])
+                .groupby(["season","fantasy_player_id"], as_index=False)
+                .agg(position=("position","first")))
+    return keep
+
+
+def build_te_features(seasons):
+    frames = []
+    for yr in seasons:
+        print(f"Engineering TE features for {yr} ...")
+        frames.append(engineer_te_features_for_season(yr))
+    out = pd.concat(frames, ignore_index=True)
+
+    # TE-appropriate usage guards (tune as desired)
+    out = out[
+        (out["targets"] >= 40) |
+        ((out["targets"] >= 25) & (out["games"] >= 4))
+    ].copy()
+    return out
+
+
+def merge_te_with_targets(te_feats: pd.DataFrame, players_leaders_multi: pd.DataFrame) -> pd.DataFrame:
+    # Expect unique ['season','fantasy_player_id'] and cols ['fp','games'] in players_leaders_multi
+    needed = {"season","fantasy_player_id","fp","games"}
+    missing = needed - set(players_leaders_multi.columns)
+    if missing:
+        raise ValueError(f"players_leaders_multi missing columns: {missing}")
+    assert not players_leaders_multi.duplicated(["season","fantasy_player_id"]).any(), \
+        "players_leaders_multi must be unique per season+player (dedupe earlier)."
+
+    # Attach positions and filter to tight ends
+    pos_tbl = load_positions_for(te_feats["season"].unique())
+    before = len(te_feats)
+    te_feats = te_feats.merge(pos_tbl, on=["season","fantasy_player_id"], how="left", validate="many_to_one")
+    te_feats = te_feats[te_feats["position"] == "TE"].copy()
+    after = len(te_feats)
+    print(f"TE position filter: kept {after}/{before} rows where position == 'TE'")
+
+    # Merge FP and PPR-defined games; replace provisional games with PPR games for consistency
+    te = te_feats.drop(columns=["games"], errors="ignore").merge(
+        players_leaders_multi[["season","fantasy_player_id","fp","games"]]
+            .rename(columns={"games":"games_ppr"}),
+        on=["season","fantasy_player_id"],
+        how="left",
+        validate="many_to_one"
+    )
+    te["fp"] = te["fp"].fillna(0.0)
+    te = te.rename(columns={"games_ppr":"games"})
+
+    # Stability filter to mirror WR/RB/QB
+    te = te[te["games"] >= 4].copy()
+    return te
+
+
+# -----------------------------
+# Example usage
+# -----------------------------
+te_feats = build_te_features(ALL_SEASONS)
+te_df = merge_te_with_targets(te_feats, players_leaders_multi)
+display(te_df.head())
+print(te_df.shape)
+
+# Optional validation against PPR leaders
+_te_valid = te_df.merge(
+    players_leaders_multi[["season","fantasy_player_id","fp"]].rename(columns={"fp":"fp_ppr"}),
+    on=["season","fantasy_player_id"], how="left", validate="many_to_one"
+)
+_te_valid["fp_diff"] = (_te_valid["fp"] - _te_valid["fp_ppr"]).round(6)
+print("TE mismatched rows:", len(_te_valid[_te_valid["fp_diff"] != 0]))
