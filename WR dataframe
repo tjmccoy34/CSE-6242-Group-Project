@@ -1,0 +1,285 @@
+# ================================
+# WR dataframe construction (final, PPR-aligned games, roster-position filtered)
+# Reuses from our PPR script:
+#   - ALL_SEASONS
+#   - fantasy_week_max(season)
+#   - base_filter(df, week_min, week_max)
+#   - normalize_team(team, season)
+#   - players_leaders_multi (unique ['season','fantasy_player_id'] with ['fp','games','fantasy_player_name'])
+#   - import nflreadpy as nfl
+# ================================
+
+import numpy as np
+import pandas as pd
+from functools import lru_cache
+
+# ---------- Shared helpers to attach roster positions ----------
+def _to_py_int_list(values) -> list[int]:
+    s = pd.Series(values)
+    return (
+        s.dropna()
+         .astype(int).astype(object).apply(int)
+         .drop_duplicates()
+         .tolist()
+    )
+
+@lru_cache(maxsize=1)
+def load_positions_for(seasons_key: tuple[int, ...]) -> pd.DataFrame:
+    """
+    Cached loader of (season, fantasy_player_id, position) using nflreadpy rosters.
+    Pass seasons as a sorted tuple of ints: tuple(sorted(unique_seasons)).
+    """
+    seasons = list(seasons_key)
+    rosters_pl = nfl.load_rosters(seasons)  # Polars
+    rosters = rosters_pl.to_pandas()
+
+    cand_id_cols = [c for c in ["gsis_id", "player_id", "gsis_player_id"] if c in rosters.columns]
+    if not cand_id_cols:
+        raise ValueError("Rosters missing GSIS id column. Expected one of gsis_id/player_id/gsis_player_id.")
+    id_col = cand_id_cols[0]
+
+    pos_tbl = (
+        rosters[["season", id_col, "position"]]
+        .dropna(subset=[id_col])
+        .copy()
+    )
+    pos_tbl["position"] = pos_tbl["position"].astype(str).str.upper().str.strip()
+    pos_tbl = (
+        pos_tbl.sort_values(["season", id_col, "position"])
+               .groupby(["season", id_col], as_index=False)
+               .agg(position=("position", "first"))
+               .rename(columns={id_col: "fantasy_player_id"})
+    )
+    return pos_tbl
+
+# ---------- WR feature engineering ----------
+def _ensure_wr_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure columns exist/cast for older seasons so WR aggregations are stable."""
+    must_int = [
+        "complete_pass", "pass_touchdown", "rush_touchdown",
+        "pass_attempt", "rush_attempt"
+    ]
+    must_float = [
+        "receiving_yards", "rushing_yards", "air_yards", "yards_after_catch", "epa"
+    ]
+
+    # Backfill attempt flags from legacy cols if needed
+    if "pass_attempt" not in df.columns and "pass" in df.columns:
+        df["pass_attempt"] = df["pass"]
+    if "rush_attempt" not in df.columns and "rush" in df.columns:
+        df["rush_attempt"] = df["rush"]
+
+    for c in must_int:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = df[c].fillna(0).astype("int64")
+
+    for c in must_float:
+        if c not in df.columns:
+            df[c] = 0.0
+        df[c] = df[c].fillna(0.0).astype("float64")
+
+    return df
+
+
+def engineer_wr_features_for_season(season: int) -> pd.DataFrame:
+    # Load & cap to fantasy-eligible REG season weeks
+    pbp_pl = nfl.load_pbp([season])
+    pbp = pbp_pl.to_pandas()
+    wk_max = fantasy_week_max(season)
+    pbp = base_filter(pbp, week_min=1, week_max=wk_max)
+
+    # Safety across vintages
+    pbp = _ensure_wr_cols(pbp)
+
+    # ---------- Targets / receptions (receiver role on pass attempts) ----------
+    is_pass = (pbp["pass_attempt"] == 1)
+    has_tgt = pbp["receiver_player_id"].notna()
+
+    tgt_rows = pbp[is_pass & has_tgt].copy()
+    rec_rows = pbp[(pbp["complete_pass"] == 1) & has_tgt].copy()
+
+    rec_g = (
+        rec_rows.groupby(["season", "receiver_player_id", "receiver_player_name"], as_index=False)
+        .agg(
+            receptions=("complete_pass", "sum"),
+            rec_yards=("receiving_yards", "sum"),
+            rec_td=("pass_touchdown", "sum"),
+            air_yards=("air_yards", "sum"),
+            yac=("yards_after_catch", "sum"),
+            rec_plays=("play_id", "count"),
+        )
+    )
+
+    tgt_g = (
+        tgt_rows.groupby(["season", "receiver_player_id", "receiver_player_name"], as_index=False)
+        .agg(
+            targets=("play_id", "count"),
+        )
+    )
+
+    # ---------- WR rushing (rusher role; WRs sometimes rush) ----------
+    is_rush = (pbp["rush_attempt"] == 1)
+    rush_rows = pbp[is_rush & pbp["rusher_player_id"].notna()].copy()
+
+    rush_g = (
+        rush_rows.groupby(["season", "rusher_player_id", "rusher_player_name"], as_index=False)
+        .agg(
+            wr_rush_att=("rush_attempt", "sum"),
+            wr_rush_yards=("rushing_yards", "sum"),
+            wr_rush_td=("rush_touchdown", "sum"),
+        )
+        .rename(columns={
+            "rusher_player_id": "receiver_player_id",
+            "rusher_player_name": "receiver_player_name"
+        })
+    )
+
+    # ---------- Combine receiving + targets + rushing ----------
+    wr = (
+        tgt_g.merge(rec_g, on=["season","receiver_player_id","receiver_player_name"], how="outer")
+             .merge(rush_g, on=["season","receiver_player_id","receiver_player_name"], how="left")
+             .fillna({
+                 "receptions":0, "rec_yards":0.0, "rec_td":0,
+                 "air_yards":0.0, "yac":0.0, "rec_plays":0,
+                 "wr_rush_att":0, "wr_rush_yards":0.0, "wr_rush_td":0,
+                 "targets":0
+             })
+    )
+
+    # ---------- Modal team label per player-season ----------
+    team_source = pd.concat([
+        tgt_rows[["season","receiver_player_id","posteam"]].rename(columns={"receiver_player_id":"pid", "posteam":"team"}),
+        rush_rows[["season","rusher_player_id","posteam"]].rename(columns={"rusher_player_id":"pid", "posteam":"team"}),
+    ], ignore_index=True)
+
+    team_mode = (
+        team_source.dropna(subset=["pid","team"])
+                   .groupby(["season","pid"])["team"]
+                   .agg(lambda s: s.dropna().astype(str).mode().iloc[0] if len(s.dropna()) > 0 else np.nan)
+                   .reset_index()
+                   .rename(columns={"pid":"receiver_player_id","team":"team"})
+    )
+
+    wr = wr.merge(team_mode, on=["season","receiver_player_id"], how="left")
+    if "team" in wr.columns:
+        wr["team"] = [normalize_team(str(t), int(s)) if pd.notna(t) else np.nan
+                      for t, s in zip(wr["team"], wr["season"])]
+
+    # ---------- Team targets & target share ----------
+    team_tgts = (
+        tgt_rows.groupby(["season","posteam"], as_index=False)
+                .agg(team_targets=("play_id","count"))
+                .rename(columns={"posteam":"team_raw"})
+    )
+    wr = wr.merge(team_tgts, left_on=["season","team"], right_on=["season","team_raw"], how="left")
+    wr = wr.drop(columns=["team_raw"], errors="ignore")
+    wr["team_targets"] = wr["team_targets"].fillna(0).astype(float)
+
+    # ---------- Feature engineering ----------
+    wr["adot"] = np.where(wr["targets"] > 0, wr["air_yards"] / wr["targets"], 0.0)
+    wr["ypr"] = np.where(wr["receptions"] > 0, wr["rec_yards"] / wr["receptions"], 0.0)
+    wr["ypt"] = np.where(wr["targets"] > 0, wr["rec_yards"] / wr["targets"], 0.0)
+    wr["yac_per_rec"] = np.where(wr["receptions"] > 0, wr["yac"] / wr["receptions"], 0.0)
+    wr["target_share"] = np.where(wr["team_targets"] > 0, wr["targets"] / wr["team_targets"], 0.0)
+
+    # Provisional "games" = #weeks with involvement (either a target or a rush)
+    inv_rows = pd.concat([
+        tgt_rows[["season","week","receiver_player_id"]].rename(columns={"receiver_player_id":"pid"}),
+        rush_rows[["season","week","rusher_player_id"]].rename(columns={"rusher_player_id":"pid"})
+    ], ignore_index=True).dropna(subset=["pid"])
+
+    inv_weeks = (
+        inv_rows.groupby(["season","pid"], as_index=False)["week"]
+                .nunique()
+                .rename(columns={"pid":"receiver_player_id","week":"games"})
+    )
+
+    wr = wr.merge(inv_weeks, on=["season","receiver_player_id"], how="left")
+    wr["games"] = wr["games"].fillna(0).astype(float)
+
+    # ---------- Final tidy + rename keys to merge with PPR leaders ----------
+    wr = wr.rename(columns={
+        "receiver_player_id":"fantasy_player_id",
+        "receiver_player_name":"fantasy_player_name",
+    })
+
+    cols_order = [
+        "season","fantasy_player_id","fantasy_player_name","team",
+        "targets","receptions","rec_yards","rec_td","air_yards","yac",
+        "adot","ypr","ypt","yac_per_rec",
+        "team_targets","target_share",
+        "wr_rush_att","wr_rush_yards","wr_rush_td",
+        "games"
+    ]
+    wr = wr[[c for c in cols_order if c in wr.columns]]
+    return wr
+
+
+def build_wr_features(seasons):
+    frames = []
+    for yr in seasons:
+        print(f"Engineering WR features for {yr} ...")
+        frames.append(engineer_wr_features_for_season(yr))
+    out = pd.concat(frames, ignore_index=True)
+
+    # Usage guards for modeling quality
+    out = out[
+        (out["targets"] >= 50) |
+        ((out["targets"] >= 30) & (out["games"] >= 4))
+    ].copy()
+    return out
+
+
+def merge_wr_with_targets(wr_feats: pd.DataFrame, players_leaders_multi: pd.DataFrame) -> pd.DataFrame:
+    # Expect unique ['season','fantasy_player_id'] and cols ['fp','games'] in players_leaders_multi
+    needed = {"season","fantasy_player_id","fp","games"}
+    missing = needed - set(players_leaders_multi.columns)
+    if missing:
+        raise ValueError(f"players_leaders_multi missing columns: {missing}")
+    assert not players_leaders_multi.duplicated(["season","fantasy_player_id"]).any(), \
+        "players_leaders_multi must be unique per season+player (dedupe earlier)."
+
+    # --- attach & filter by roster position (WR only) ---
+    wr_seasons_key = tuple(sorted(_to_py_int_list(wr_feats["season"].unique())))
+    positions_tbl = load_positions_for(wr_seasons_key)
+
+    wr_feats = wr_feats.merge(
+        positions_tbl, on=["season","fantasy_player_id"], how="left", validate="many_to_one"
+    )
+    pre_n = len(wr_feats)
+    wr_feats = wr_feats[wr_feats["position"].astype(str).str.upper().eq("WR")].copy()
+    post_n = len(wr_feats)
+    print(f"WR position filter: kept {post_n}/{pre_n} rows where position == 'WR'")
+
+    # --- merge FP + PPR-defined games ---
+    wr = wr_feats.drop(columns=["games"], errors="ignore").merge(
+        players_leaders_multi[["season","fantasy_player_id","fp","games"]]
+            .rename(columns={"games":"games_ppr"}),
+        on=["season","fantasy_player_id"],
+        how="left",
+        validate="many_to_one"
+    )
+    wr["fp"] = wr["fp"].fillna(0.0)
+    wr = wr.rename(columns={"games_ppr":"games"})
+
+    # Stability (optional)
+    wr = wr[wr["games"] >= 4].copy()
+    return wr
+
+
+# -----------------------------
+# Example usage
+# -----------------------------
+wr_feats = build_wr_features(ALL_SEASONS)
+wr_df = merge_wr_with_targets(wr_feats, players_leaders_multi)
+display(wr_df.head())
+print(wr_df.shape)
+
+# Optional validation against PPR leaders
+_wr_valid = wr_df.merge(
+    players_leaders_multi[["season","fantasy_player_id","fp"]].rename(columns={"fp":"fp_ppr"}),
+    on=["season","fantasy_player_id"], how="left", validate="many_to_one"
+)
+_wr_valid["fp_diff"] = (_wr_valid["fp"] - _wr_valid["fp_ppr"]).round(6)
+print("WR mismatched rows:", len(_wr_valid[_wr_valid["fp_diff"] != 0]))
