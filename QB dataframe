@@ -1,0 +1,239 @@
+# ================================
+# QB dataframe construction (final, PPR-aligned games, position-pure)
+# Reuses from our PPR script:
+#   - ALL_SEASONS
+#   - fantasy_week_max(season)
+#   - base_filter(df, week_min, week_max)
+#   - safe_col(df, name, default=0)
+#   - normalize_team(team, season)
+#   - players_leaders_multi with unique ['season','fantasy_player_id'] and cols ['fp','games']
+#   - import nflreadpy as nfl
+# ================================
+
+# ---- FIXED: positions helper (nflreadpy rosters) ----
+def _load_positions_from_rosters(seasons) -> pd.DataFrame:
+    """
+    Load (season, gsis_id, position) from nflreadpy rosters and collapse to one row per season+player.
+    Merges on GSIS ID which matches your fantasy_player_id (e.g. '00-0033873').
+    Coerces seasons to plain Python ints to satisfy nflreadpy's type checks.
+    """
+    # Coerce seasons -> clean list[int]
+    season_series = pd.Series(seasons)
+    seasons_clean = (
+        season_series.dropna()
+        .astype(int)                      # safe if originals were floats/np.int64
+        .astype(object)                   # ensure Python ints, not numpy ints
+        .apply(int)
+        .drop_duplicates()
+        .tolist()
+    )
+
+    rosters_pl = nfl.load_rosters(seasons_clean)  # Polars
+    rosters = rosters_pl.to_pandas()
+
+    # Be defensive about column names
+    cand_id_cols = [c for c in ["gsis_id", "player_id", "gsis_player_id"] if c in rosters.columns]
+    if not cand_id_cols:
+        raise ValueError("No GSIS id-like column found in rosters. Expected one of: gsis_id/player_id/gsis_player_id.")
+    id_col = cand_id_cols[0]
+
+    need = {"season", id_col, "position"}
+    if not need.issubset(rosters.columns):
+        missing = need - set(rosters.columns)
+        raise ValueError(f"Rosters table missing required columns: {missing}")
+
+    pos_tbl = (
+        rosters[["season", id_col, "position"]]
+        .dropna(subset=[id_col])
+        .copy()
+    )
+    pos_tbl["position"] = pos_tbl["position"].astype(str).str.upper()
+    pos_tbl = (
+        pos_tbl.sort_values(["season", id_col, "position"])
+               .groupby(["season", id_col], as_index=False)
+               .agg(position=("position", "first"))
+    )
+    pos_tbl = pos_tbl.rename(columns={id_col: "fantasy_player_id"})  # align to our key
+    return pos_tbl
+
+
+def _ensure_qb_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Make sure QB/stat columns exist and are numeric so groupby/agg works on older seasons."""
+    must_int = [
+        "complete_pass", "pass_touchdown", "interception", "sack",
+        "rush_touchdown", "qb_scramble"
+    ]
+    must_float = [
+        "passing_yards", "air_yards", "yards_after_catch",
+        "epa", "rushing_yards"
+    ]
+    # If pass_attempt/rush_attempt are missing, derive from pass/rush
+    if "pass_attempt" not in df.columns and "pass" in df.columns:
+        df["pass_attempt"] = df["pass"]
+    if "rush_attempt" not in df.columns and "rush" in df.columns:
+        df["rush_attempt"] = df["rush"]
+
+    for c in must_int:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = df[c].fillna(0).astype("int64")
+
+    for c in must_float:
+        if c not in df.columns:
+            df[c] = 0.0
+        df[c] = df[c].fillna(0.0).astype("float64")
+
+    for c in ["pass_attempt", "rush_attempt"]:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = df[c].fillna(0).astype("int64")
+
+    return df
+
+
+def engineer_qb_features_for_season(season: int) -> pd.DataFrame:
+    # Load & cap to fantasy-eligible REG season weeks
+    pbp_pl = nfl.load_pbp([season])
+    pbp = pbp_pl.to_pandas()
+    wk_max = fantasy_week_max(season)
+    pbp = base_filter(pbp, week_min=1, week_max=wk_max)
+
+    # Safety: ensure needed columns exist across vintages
+    pbp = _ensure_qb_cols(pbp)
+
+    # Role flags (robust fallbacks for older years)
+    pass_attempt_flag = (pbp.get('pass_attempt', pbp.get('pass', 0)).fillna(0).astype(int) == 1)
+    rush_attempt_flag = (pbp.get('rush_attempt', pbp.get('rush', 0)).fillna(0).astype(int) == 1)
+
+    # Use actual actor IDs (passer/rusher) rather than fantasy attribution
+    pbp['player_id'] = np.where(pass_attempt_flag, pbp.get('passer_player_id'),
+                        np.where(rush_attempt_flag, pbp.get('rusher_player_id'), np.nan))
+    pbp['player_name'] = np.where(pass_attempt_flag, pbp.get('passer_player_name'),
+                          np.where(rush_attempt_flag, pbp.get('rusher_player_name'), np.nan))
+    pbp = pbp[pbp['player_id'].notna()].copy()
+
+    # For aggregation, store the attempt flags explicitly (ints)
+    pbp['__pass_'] = pass_attempt_flag.astype(int)
+    pbp['__rush_'] = rush_attempt_flag.astype(int)
+
+    # Season aggregates per player
+    g = (
+        pbp.groupby(['season','player_id','player_name'])
+        .agg(
+            games=('week', 'nunique'),              # provisional; replaced later with PPR-defined games
+            plays=('play_id', 'count'),
+            pass_plays=('__pass_', 'sum'),
+            rush_plays=('__rush_', 'sum'),
+            comp=('complete_pass', 'sum'),
+            pass_yards=('passing_yards', 'sum'),
+            pass_td=('pass_touchdown', 'sum'),
+            interceptions=('interception', 'sum'),
+            sacks=('sack', 'sum'),
+            air_yards=('air_yards', 'sum'),
+            yac=('yards_after_catch', 'sum'),
+            epa_sum=('epa', 'sum'),
+            rush_yards=('rushing_yards', 'sum'),
+            rush_td=('rush_touchdown', 'sum'),
+            scrambles=('qb_scramble', 'sum')
+        )
+        .reset_index()
+    )
+
+    # Modal team (posteam) per season, then normalize historically
+    team_mode = (
+        pbp.groupby(['season','player_id'])['posteam']
+        .agg(lambda s: s.dropna().astype(str).mode().iloc[0] if len(s.dropna()) > 0 else np.nan)
+        .rename('team')
+        .reset_index()
+    )
+    g = g.merge(team_mode, on=['season','player_id'], how='left')
+    if 'team' in g.columns:
+        g['team'] = [normalize_team(str(t), int(s)) if pd.notna(t) else np.nan
+                     for t, s in zip(g['team'], g['season'])]
+
+    # Rates
+    g['comp_pct'] = np.where(g['pass_plays'] > 0, g['comp'] / g['pass_plays'], 0.0)
+    g['ypa'] = np.where(g['pass_plays'] > 0, g['pass_yards'] / g['pass_plays'], 0.0)
+    g['td_rate'] = np.where(g['pass_plays'] > 0, g['pass_td'] / g['pass_plays'], 0.0)
+    g['int_rate'] = np.where(g['pass_plays'] > 0, g['interceptions'] / g['pass_plays'], 0.0)
+    g['sack_rate'] = np.where((g['pass_plays'] + g['sacks']) > 0, g['sacks'] / (g['pass_plays'] + g['sacks']), 0.0)
+    g['air_ypa'] = np.where(g['pass_plays'] > 0, g['air_yards'] / g['pass_plays'], 0.0)
+    g['yac_ypa'] = np.where(g['pass_plays'] > 0, g['yac'] / g['pass_plays'], 0.0)
+    g['epa_per_pass'] = np.where(g['pass_plays'] > 0, g['epa_sum'] / g['pass_plays'], 0.0)
+    g['rush_yards_per_att'] = np.where(g['rush_plays'] > 0, g['rush_yards'] / g['rush_plays'], 0.0)
+
+    # QB-ness
+    denom = g['pass_plays'] + g['rush_plays']
+    g['passer_share'] = np.where(denom > 0, g['pass_plays'] / denom, 0.0)
+
+    # Rename to align merge key with fantasy tables
+    g = g.rename(columns={'player_id': 'fantasy_player_id', 'player_name': 'fantasy_player_name'})
+    g = g.drop(columns=[c for c in g.columns if c.startswith('__')], errors='ignore')
+    return g
+
+
+def build_qb_features(seasons):
+    frames = []
+    for yr in seasons:
+        print(f"Engineering QB features for {yr} ...")
+        frames.append(engineer_qb_features_for_season(yr))
+    out = pd.concat(frames, ignore_index=True)
+
+    # Real quarterbacks only (pre-filter by usage/volume)
+    out = out[
+        (out['pass_plays'] >= 150) |
+        ((out['pass_plays'] >= 100) & (out['passer_share'] >= 0.60))
+    ].copy()
+    return out
+
+
+def merge_qb_with_targets(qb_feats: pd.DataFrame, players_leaders_multi: pd.DataFrame) -> pd.DataFrame:
+    # Expect unique ['season','fantasy_player_id'] and cols ['fp','games'] in players_leaders_multi
+    needed = {'season','fantasy_player_id','fp','games'}
+    missing = needed - set(players_leaders_multi.columns)
+    if missing:
+        raise ValueError(f"players_leaders_multi missing columns: {missing}")
+    assert not players_leaders_multi.duplicated(['season','fantasy_player_id']).any(), \
+        "players_leaders_multi must be unique per season+player (dedupe earlier)."
+
+    # ---- bring in positions from nflreadpy rosters and attach to qb_feats ----
+    positions_tbl = _load_positions_from_rosters(qb_feats["season"].unique())
+    qb_feats = qb_feats.merge(
+        positions_tbl, on=["season","fantasy_player_id"], how="left", validate="many_to_one"
+    )
+
+    # Merge FP and PPR-defined games; replace provisional games with PPR games for consistency
+    qb = qb_feats.drop(columns=['games'], errors='ignore').merge(
+        players_leaders_multi[['season','fantasy_player_id','fp','games']].rename(columns={'games':'games_ppr'}),
+        on=['season','fantasy_player_id'], how='left', validate='many_to_one'
+    )
+    qb['fp'] = qb['fp'].fillna(0.0)
+    qb = qb.rename(columns={'games_ppr':'games'})
+
+    # Hard filter to true QBs
+    pre_n = len(qb)
+    qb = qb[qb['position'].str.upper().eq('QB')].copy()
+    post_n = len(qb)
+    print(f"QB position filter: kept {post_n}/{pre_n} rows where position == 'QB'")
+
+    # Stability filter
+    qb = qb[qb['games'] >= 4].copy()
+    return qb
+
+
+# -----------------------------
+# Example usage
+# -----------------------------
+qb_feats = build_qb_features(ALL_SEASONS)
+qb_df = merge_qb_with_targets(qb_feats, players_leaders_multi)
+display(qb_df.head())
+print(qb_df.shape)
+
+# Optional validation
+_valid = qb_df.merge(
+    players_leaders_multi[['season','fantasy_player_id','fp']].rename(columns={'fp':'fp_ppr'}),
+    on=['season','fantasy_player_id'], how='left', validate='many_to_one'
+)
+_valid['fp_diff'] = (_valid['fp'] - _valid['fp_ppr']).round(6)
+print("Mismatched rows:", len(_valid[_valid['fp_diff'] != 0]))
+
