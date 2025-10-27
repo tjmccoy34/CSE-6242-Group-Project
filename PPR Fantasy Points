@@ -11,7 +11,7 @@ import nflreadpy as nfl
 # ----------------------------------
 # Config
 # ----------------------------------
-ALL_SEASONS = list(range(1999, 2025))  # 1999–2023 in one pass
+ALL_SEASONS = list(range(1999, 2025))  # 1999–2024 in one pass
 
 def fantasy_week_max(season: int) -> int:
     # Common fantasy policy: stop before NFL's final week
@@ -60,55 +60,119 @@ def safe_col(df, name, default=0):
     return df[name].fillna(0) if name in df.columns else 0
 
 # ----------------------------------
-# 1) Player PPR (ESPN-standard)
+# 1) Player PPR (ESPN-standard) — role-based attribution
 # ----------------------------------
 def player_ppr(pbp_reg: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = pbp_reg.copy()
 
-    pass_attempt   = (df.get("pass_attempt", df.get("pass", 0)).fillna(0).astype(int) == 1)
-    rush_attempt   = (df.get("rush_attempt", df.get("rush", 0)).fillna(0).astype(int) == 1)
-    complete_pass  = (df.get("complete_pass", 0).fillna(0).astype(int) == 1)
+    # Flags (handle legacy column names too)
+    pass_attempt  = (df.get("pass_attempt", df.get("pass", 0)).fillna(0).astype(int) == 1)
+    rush_attempt  = (df.get("rush_attempt", df.get("rush", 0)).fillna(0).astype(int) == 1)
+    complete_pass = (df.get("complete_pass", 0).fillna(0).astype(int) == 1)
 
-    pass_role = pass_attempt  & (df["fantasy_player_id"] == df["passer_player_id"])
-    rush_role = rush_attempt  & (df["fantasy_player_id"] == df["rusher_player_id"])
-    recv_role = complete_pass & (df["fantasy_player_id"] == df["receiver_player_id"])
+    # -------------------------------
+    # Passing → credit the PASSER
+    # -------------------------------
+    pass_pts = (
+        safe_col(df, "passing_yards")*0.04 +
+        safe_col(df, "pass_touchdown")*4 -
+        safe_col(df, "interception")*2
+    )
+    passing = pd.DataFrame({
+        "season": df["season"],
+        "week": df["week"],
+        "player_id": df.get("passer_player_id"),
+        "player_name": df.get("passer_player_name"),
+        "fp": np.where(pass_attempt, pass_pts, 0.0)
+    })
 
-    # Passing
-    pass_fp = np.where(pass_role,
-                       safe_col(df, "passing_yards")*0.04 + safe_col(df, "pass_touchdown")*4 - safe_col(df, "interception")*2,
-                       0)
-    # Rushing
-    rush_fp = np.where(rush_role,
-                       safe_col(df, "rushing_yards")*0.1 + safe_col(df, "rush_touchdown")*6,
-                       0)
-    # Receiving (PPR + yards + receiving TDs are flagged by pass_touchdown)
-    reception_pts = np.where(recv_role, 1, 0)
-    recv_yards_td = np.where(recv_role,
-                             safe_col(df, "receiving_yards")*0.1 + safe_col(df, "pass_touchdown")*6,
-                             0)
+    # -------------------------------
+    # Rushing → credit the RUSHER
+    # -------------------------------
+    rush_pts = (
+        safe_col(df, "rushing_yards")*0.1 +
+        safe_col(df, "rush_touchdown")*6
+    )
+    rushing = pd.DataFrame({
+        "season": df["season"],
+        "week": df["week"],
+        "player_id": df.get("rusher_player_id"),
+        "player_name": df.get("rusher_player_name"),
+        "fp": np.where(rush_attempt, rush_pts, 0.0)
+    })
 
-    # 2-pt conversions: credit receiver on pass or rusher on rush (success only)
+    # ------------------------------------------------------------
+    # Receiving (PPR) → credit the RECEIVER on completed passes
+    #   +1 per reception, +0.1 per rec yard, +6 for receiving TD
+    #   (Receiving TDs appear via pass_touchdown on receiver rows)
+    # ------------------------------------------------------------
+    recv_pts = (
+        1.0 +
+        safe_col(df, "receiving_yards")*0.1 +
+        safe_col(df, "pass_touchdown")*6
+    )
+    receiving = pd.DataFrame({
+        "season": df["season"],
+        "week": df["week"],
+        "player_id": df.get("receiver_player_id"),
+        "player_name": df.get("receiver_player_name"),
+        "fp": np.where(complete_pass, recv_pts, 0.0)
+    })
+
+    # ------------------------------------------------------------
+    # Two-point conversions
+    #   - credit RECEIVER for successful pass 2-pt
+    #   - credit RUSHER   for successful rush 2-pt
+    # ------------------------------------------------------------
     two_pt_success = (safe_col(df, "two_point_attempt") == 1) & (df.get("two_point_conv_result", "") == "success")
-    two_pt_recv = two_pt_success & (safe_col(df, "pass") == 1) & (df["fantasy_player_id"] == df["receiver_player_id"])
-    two_pt_rush = two_pt_success & (safe_col(df, "rush") == 1) & (df["fantasy_player_id"] == df["rusher_player_id"])
-    two_pt_fp = np.where(two_pt_recv | two_pt_rush, 2, 0)
 
-    # Fumbles lost
-    fum_fp = np.where((safe_col(df, "fumble_lost") == 1) & (df["fantasy_player_id"] == df.get("fumbled_1_player_id")),
-                      -2, 0)
+    two_pt_recv = pd.DataFrame({
+        "season": df["season"], "week": df["week"],
+        "player_id": df.get("receiver_player_id"),
+        "player_name": df.get("receiver_player_name"),
+        "fp": np.where(two_pt_success & (safe_col(df, "pass") == 1), 2.0, 0.0)
+    })
 
-    df["fp"] = pass_fp + rush_fp + reception_pts + recv_yards_td + two_pt_fp + fum_fp
+    two_pt_rush = pd.DataFrame({
+        "season": df["season"], "week": df["week"],
+        "player_id": df.get("rusher_player_id"),
+        "player_name": df.get("rusher_player_name"),
+        "fp": np.where(two_pt_success & (safe_col(df, "rush") == 1), 2.0, 0.0)
+    })
 
-    leaders = (df.groupby(["season","fantasy_player_id","fantasy_player_name"], as_index=False)["fp"].sum()
-                 .sort_values(["season","fp"], ascending=[True, False]))
-    games = (df.loc[df["fp"] != 0]
-               .groupby(["season","fantasy_player_id","fantasy_player_name"], as_index=False)["week"].nunique()
-               .rename(columns={"week":"games"}))
-    leaders = leaders.merge(games, on=["season","fantasy_player_id","fantasy_player_name"], how="left")
+    # ------------------------------------------------------------
+    # Fumbles lost → credit the fumbling player (-2)
+    # ------------------------------------------------------------
+    fum_lost = pd.DataFrame({
+        "season": df["season"], "week": df["week"],
+        "player_id": df.get("fumbled_1_player_id"),
+        "player_name": None,  # name may be missing on these rows
+        "fp": np.where(safe_col(df, "fumble_lost") == 1, -2.0, 0.0)
+    })
+
+    # Stack all role-attributed rows
+    parts = [passing, rushing, receiving, two_pt_recv, two_pt_rush, fum_lost]
+    all_rows = pd.concat(parts, ignore_index=True)
+
+    # Keep only rows with a valid player_id
+    all_rows = all_rows[all_rows["player_id"].notna()].copy()
+
+    # Aggregate to weekly, then season leaders
+    weekly = (all_rows.groupby(["season","player_id","player_name","week"], as_index=False)["fp"].sum()
+                        .sort_values(["season","player_name","week"]))
+    leaders = (weekly.groupby(["season","player_id","player_name"], as_index=False)["fp"].sum()
+                      .sort_values(["season","fp"], ascending=[True, False]))
+
+    # Games = count of weeks with non-zero FP
+    games = (weekly.loc[weekly["fp"] != 0]
+                   .groupby(["season","player_id","player_name"], as_index=False)["week"].nunique()
+                   .rename(columns={"week":"games"}))
+    leaders = leaders.merge(games, on=["season","player_id","player_name"], how="left")
     leaders["ppg"] = leaders["fp"] / leaders["games"]
 
-    weekly = (df.groupby(["season","fantasy_player_id","fantasy_player_name","week"], as_index=False)["fp"].sum()
-                .sort_values(["season","fantasy_player_name","week"]))
+    # Rename to canonical keys expected downstream
+    leaders = leaders.rename(columns={"player_id":"fantasy_player_id","player_name":"fantasy_player_name"})
+    weekly  = weekly.rename(columns={"player_id":"fantasy_player_id","player_name":"fantasy_player_name"})
 
     return leaders, weekly
 
@@ -299,6 +363,20 @@ dst_season_multi      = pd.concat(dst_all, ignore_index=True)
 dst_per_game_multi    = pd.concat(dst_games_all, ignore_index=True)
 k_season_multi        = pd.concat(k_all, ignore_index=True)
 k_per_game_multi      = pd.concat(k_games_all, ignore_index=True)
+
+# ---- Canonicalize player-season leaders (dedupe to 1 row per season+player) ----
+players_leaders_multi = (
+    players_leaders_multi
+      .sort_values(['season','fantasy_player_id','fp'], ascending=[True, True, False])
+      .groupby(['season','fantasy_player_id'], as_index=False)
+      .agg(
+          fp=('fp','first'),                 # season total FP
+          games=('games','max'),             # keep max credited games if duplicates disagree
+          fantasy_player_name=('fantasy_player_name','first')
+      )
+)
+# Guarantee uniqueness
+assert not players_leaders_multi.duplicated(['season','fantasy_player_id']).any(), "Duplicate player-season keys remain."
 
 # Examples:
 display(players_leaders_multi.groupby("season").head(10))
